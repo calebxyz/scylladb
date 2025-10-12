@@ -15,14 +15,12 @@
 #include <seastar/core/sharded.hh>
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/with_scheduling_group.hh>
-#include <seastar/core/lowres_clock.hh>
 
 #include "seastarx.hh"
 #include "auth/service.hh"
 #include "cql3/description.hh"
 #include <map>
 #include "qos_common.hh"
-#include "mutation/mutation.hh"
 #include "service/endpoint_lifecycle_subscriber.hh"
 #include "qos_configuration_change_subscriber.hh"
 #include "service/raft/raft_group0_client.hh"
@@ -106,7 +104,6 @@ using update_both_cache_levels = bool_class<class update_both_cache_levels_tag>;
 class service_level_controller : public peering_sharded_service<service_level_controller>, public service::endpoint_lifecycle_subscriber {
 public:
     static inline const int32_t default_shares = 1000;
-    static constexpr auto driver_service_level_name = "driver";
 
     class service_level_distributed_data_accessor {
     public:
@@ -154,6 +151,7 @@ public:
         std::optional<service_level_options> find_cached_effective_service_level(const sstring& role_name);
 
         future<scheduling_group> get_user_scheduling_group(const std::optional<auth::authenticated_user>& usr);
+        scheduling_group get_user_cached_scheduling_group(const std::optional<auth::authenticated_user>& usr);
 
         template <typename Func, typename Ret = std::invoke_result_t<Func>>
             requires std::invocable<Func>
@@ -176,7 +174,7 @@ public:
         future<std::vector<cql3::description>> describe_attached_service_levels();
 
         /// Must be executed on shard 0.
-        future<> reload_cache(qos::query_context ctx);
+        future<> reload_cache();
 
         void clear_cache();
     };
@@ -224,7 +222,6 @@ private:
     unsigned _logged_intervals;
     atomic_vector<qos_configuration_change_subscriber*> _subscribers;
     optimized_optional<abort_source::subscription> _early_abort_subscription;
-    seastar::lowres_clock::time_point _last_unsuccessful_driver_sl_creation_attemp = seastar::lowres_clock::time_point::min();
     void do_abort() noexcept;
 public:
     service_level_controller(sharded<auth::service>& auth_service, locator::shared_token_metadata& tm, abort_source& as, service_level_options default_service_level_config,
@@ -327,6 +324,15 @@ public:
      * @return if the user is authenticated the user's scheduling group. otherwise get_scheduling_group("default")
      */
     future<scheduling_group> get_user_scheduling_group(const std::optional<auth::authenticated_user>& usr);
+
+    /**
+     * Get the scheduling group of a specific user for the service level cache
+     * @param user - the user for determining the service level
+     * @return if the user is authenticated the user's scheduling group. otherwise get_scheduling_group("default")
+     */
+    scheduling_group get_cached_user_scheduling_group(const std::optional<auth::authenticated_user>& usr);
+
+
     /**
      * @return the name of the currently active service level if such exists or an empty
      * optional if no active service level.
@@ -347,18 +353,6 @@ public:
      * @return a future that is resolved when the update loop stops.
      */
     void maybe_start_legacy_update_from_distributed_data(std::function<steady_clock_type::duration()> interval_f, service::storage_service& storage_service, service::raft_group0_client& group0_client);
-
-    /**
-     * Get mutations required to:
-     * 1. create `sl:driver`
-     * 2. store information that `sl:driver` was created in `system.scylla_local`
-     */
-    static future<utils::chunked_vector<mutation>> get_create_driver_service_level_mutations(db::system_keyspace& sys_ks, api::timestamp_type timestamp);
-    /**
-     * Create `sl:driver` using _sl_data_accessor if possible. If `sl:driver` exists or it's created, store
-       the information it was created in `system.scylla_local`.
-     */
-    future<std::optional<service::group0_guard>> migrate_to_driver_service_level(service::group0_guard guard, db::system_keyspace& sys_ks);
 
     /**
      * Request abort of update loop.

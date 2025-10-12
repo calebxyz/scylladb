@@ -286,6 +286,8 @@ private:
     private:
         friend class process_request_executor;
 
+        void update_user_scheduling_group_async();
+        void update_user_scheduling_group_sync();
         future<foreign_ptr<std::unique_ptr<cql_server::response>>> sleep_until_timeout_passes(const seastar::lowres_clock::time_point& timeout, std::unique_ptr<cql_server::response>&& resp) const;
         future<foreign_ptr<std::unique_ptr<cql_server::response>>> process_request_one(fragmented_temporary_buffer::istream buf, uint8_t op, uint16_t stream, service::client_state& client_state, tracing_request_type tracing_request, service_permit permit);
         unsigned frame_size() const;
@@ -367,12 +369,6 @@ private:
 
 private:
     virtual shared_ptr<generic_server::connection> make_connection(socket_address server_addr, connected_socket&& fd, socket_address addr, named_semaphore& sem, semaphore_units<named_semaphore_exception_factory> initial_sem_units) override;
-    scheduling_group get_scheduling_group_for_new_connection() const override {
-        if (_sl_controller.has_service_level(qos::service_level_controller::driver_service_level_name)) {
-            return _sl_controller.get_scheduling_group(qos::service_level_controller::driver_service_level_name);
-        }
-        return default_scheduling_group();
-    }
 
     ::timeout_config timeout_config() const { return _config.timeout_config.current_values(); }
 };
