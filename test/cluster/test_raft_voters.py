@@ -32,7 +32,7 @@ async def get_number_of_voters(manager: ManagerClient, srv: ServerInfo):
 # (the DC1 must not have 2 voters otherwise losing it would result in the raft majority loss).
 @pytest.mark.parametrize('num_nodes', [1, 3])
 @pytest.mark.parametrize('stop_gracefully', [True, False])
-async def test_raft_voters_multidc_kill_dc(manager: ManagerClient, num_nodes: int, stop_gracefully: bool):
+async def test_raft_voters_multidc_kill_dc(manager: ManagerClient, num_nodes: int, stop_gracefully: bool, scale_nodes):
     """
     Test the basic functionality of limited voters in a multi-DC cluster.
 
@@ -58,15 +58,15 @@ async def test_raft_voters_multidc_kill_dc(manager: ManagerClient, num_nodes: in
         {
             'property_file': {'dc': 'dc1', 'rack': 'rack1'},
             # The large DC has 2x the number of nodes of the smaller DCs
-            'num_nodes': 2 * num_nodes,
+            'num_nodes': scale_nodes(2 * num_nodes),
         },
         {
             'property_file': {'dc': 'dc2', 'rack': 'rack2'},
-            'num_nodes': num_nodes,
+            'num_nodes': scale_nodes(num_nodes),
         },
         {
             'property_file': {'dc': 'dc3', 'rack': 'rack3'},
-            'num_nodes': num_nodes,
+            'num_nodes': scale_nodes(num_nodes),
         },
     ]
 

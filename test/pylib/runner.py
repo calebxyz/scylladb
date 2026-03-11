@@ -25,6 +25,7 @@ import pytest
 import xdist
 import yaml
 from _pytest.junitxml import xml_key
+from test import MODES_FACTOR
 
 
 from test import ALL_MODES, DEBUG_MODES, TEST_RUNNER, TOP_SRC_DIR, TESTPY_PREPARED_ENVIRONMENT, HOST_ID
@@ -160,6 +161,14 @@ def scale_timeout(build_mode: str) -> Callable[[int | float], int | float]:
         return scale_timeout_by_mode(build_mode, timeout)
 
     return scale_timeout_inner
+
+
+@pytest.fixture(scope=testpy_test_fixture_scope)
+def scale_nodes(build_mode: str) -> Callable[[int], int]:
+    def scale_nodes_inner(num_nodes: int) -> int:
+       return max(1, num_nodes // MODES_FACTOR.get(build_mode, 1)
+
+    return scale_nodes_inner    
 
 
 @pytest.fixture(scope=testpy_test_fixture_scope)
