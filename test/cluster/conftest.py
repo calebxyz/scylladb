@@ -22,6 +22,7 @@ from test import TOP_SRC_DIR, path_to
 from test.pylib.runner import testpy_test_fixture_scope
 from test.pylib.random_tables import RandomTables
 from test.pylib.util import unique_name
+from test.pylib.direct_manager_client import DirectManagerClient
 from test.pylib.manager_client import ManagerClient
 from test.pylib.async_cql import run_async
 from test.pylib.scylla_cluster import ScyllaClusterManager, ScyllaVersionDescription, get_scylla_2025_1_description
@@ -77,6 +78,8 @@ async def decode_backtrace(build_mode: str, input: str):
 def pytest_addoption(parser):
     parser.addoption('--manager-api', action='store',
                      help='Manager unix socket path')
+    parser.addoption('--manager-mode', action='store', choices=['direct', 'socket'], default='direct',
+                     help='Manager transport mode for in-process topology tests')
     add_cql_connection_options(parser)
     parser.addoption('--skip-internet-dependent-tests', action='store_true', default=False,
                      help='Skip tests which depend on artifacts from the internet')
@@ -183,9 +186,32 @@ def cluster_con(hosts: list[IPAddress | EndPoint], port: int = 9042, use_ssl: bo
 
 
 @pytest.fixture(scope=testpy_test_fixture_scope)
-async def manager_api_sock_path(request: pytest.FixtureRequest, testpy_test: Test | None) -> AsyncGenerator[str]:
+async def cluster_manager(request: pytest.FixtureRequest, testpy_test: Test | None) -> AsyncGenerator[ScyllaClusterManager | None]:
+    if testpy_test is None or request.config.getoption("--manager-mode") == "socket":
+        yield None
+        return
+
+    mgr = ScyllaClusterManager(test_uname=testpy_test.uname, clusters=testpy_test.suite.clusters,
+                               base_dir=str(testpy_test.suite.log_dir))
+    await mgr.start()
+    try:
+        yield mgr
+    finally:
+        await mgr.stop()
+
+
+@pytest.fixture(scope=testpy_test_fixture_scope)
+async def manager_api_sock_path(request: pytest.FixtureRequest, testpy_test: Test | None,
+                                cluster_manager: ScyllaClusterManager | None) -> AsyncGenerator[str]:
     if testpy_test is None:
-        yield request.config.getoption("--manager-api")
+        manager_api = request.config.getoption("--manager-api")
+        if not isinstance(manager_api, str) or not manager_api:
+            raise pytest.UsageError(
+                "--manager-api must be provided as a non-empty string when running without a test definition (testpy_test is None)"
+            )
+        yield manager_api
+    elif cluster_manager is not None:
+        yield cluster_manager.sock_path
     else:
         test_uname = testpy_test.uname
         clusters = testpy_test.suite.clusters
@@ -214,9 +240,10 @@ async def manager_api_sock_path(request: pytest.FixtureRequest, testpy_test: Tes
 
 
 @pytest.fixture(scope=testpy_test_fixture_scope)
-async def manager_internal(request: pytest.FixtureRequest, manager_api_sock_path: str) -> Callable[[], ManagerClient]:
+async def manager_internal(request: pytest.FixtureRequest, manager_api_sock_path: str,
+                           cluster_manager: ScyllaClusterManager | None) -> Callable[[], ManagerClient]:
     """Session fixture to prepare client object for communicating with the Cluster API.
-       Pass the Unix socket path where the Manager server API is listening.
+       Pass the manager transport used for communicating with the Cluster API.
        Pass a function to create driver connections.
        Test cases (functions) should not use this fixture.
     """
@@ -228,12 +255,14 @@ async def manager_internal(request: pytest.FixtureRequest, manager_api_sock_path
         auth_provider = PlainTextAuthProvider(username=auth_username, password=auth_password)
     else:
         auth_provider = None
+    client_factory = None if cluster_manager is None else lambda: DirectManagerClient(cluster_manager)
     return lambda: ManagerClient(
         sock_path=manager_api_sock_path,
         port=port,
         use_ssl=use_ssl,
         auth_provider=auth_provider,
         con_gen=cluster_con,
+        client_factory=client_factory,
     )
 
 
