@@ -31,6 +31,7 @@ from test.pylib.suite.python import add_cql_connection_options
 from test.pylib.encryption_provider import KeyProvider, make_key_provider_factory
 import logging
 import pytest
+import pytest_asyncio
 from cassandra.auth import PlainTextAuthProvider                         # type: ignore # pylint: disable=no-name-in-module
 from cassandra.cluster import Session                                    # type: ignore # pylint: disable=no-name-in-module
 from cassandra.cluster import Cluster, ConsistencyLevel                  # type: ignore # pylint: disable=no-name-in-module
@@ -185,14 +186,14 @@ def cluster_con(hosts: list[IPAddress | EndPoint], port: int = 9042, use_ssl: bo
                    )
 
 
-@pytest.fixture(scope=testpy_test_fixture_scope)
-async def cluster_manager(request: pytest.FixtureRequest, testpy_test: Test | None) -> AsyncGenerator[ScyllaClusterManager | None]:
+@pytest_asyncio.fixture(scope="function", loop_scope="function")
+async def direct_cluster_manager(request: pytest.FixtureRequest, testpy_test: Test | None) -> AsyncGenerator[ScyllaClusterManager | None]:
     if testpy_test is None or request.config.getoption("--manager-mode") == "socket":
         yield None
         return
 
     mgr = ScyllaClusterManager(test_uname=testpy_test.uname, clusters=testpy_test.suite.clusters,
-                               base_dir=str(testpy_test.suite.log_dir))
+                               base_dir=str(testpy_test.suite.log_dir), create_cluster=testpy_test.suite.create_cluster)
     await mgr.start()
     try:
         yield mgr
@@ -201,8 +202,7 @@ async def cluster_manager(request: pytest.FixtureRequest, testpy_test: Test | No
 
 
 @pytest.fixture(scope=testpy_test_fixture_scope)
-async def manager_api_sock_path(request: pytest.FixtureRequest, testpy_test: Test | None,
-                                cluster_manager: ScyllaClusterManager | None) -> AsyncGenerator[str]:
+async def socket_manager_api_sock_path(request: pytest.FixtureRequest, testpy_test: Test | None) -> AsyncGenerator[str]:
     if testpy_test is None:
         manager_api = request.config.getoption("--manager-api")
         if not isinstance(manager_api, str) or not manager_api:
@@ -210,8 +210,6 @@ async def manager_api_sock_path(request: pytest.FixtureRequest, testpy_test: Tes
                 "--manager-api must be provided as a non-empty string when running without a test definition (testpy_test is None)"
             )
         yield manager_api
-    elif cluster_manager is not None:
-        yield cluster_manager.sock_path
     else:
         test_uname = testpy_test.uname
         clusters = testpy_test.suite.clusters
@@ -239,9 +237,31 @@ async def manager_api_sock_path(request: pytest.FixtureRequest, testpy_test: Tes
             future.result()
 
 
+@pytest_asyncio.fixture(scope="function", loop_scope="function")
+async def direct_manager_internal(request: pytest.FixtureRequest, direct_cluster_manager: ScyllaClusterManager | None) -> Callable[[], ManagerClient] | None:
+    if direct_cluster_manager is None:
+        return None
+
+    port = int(request.config.getoption('port'))
+    use_ssl = bool(request.config.getoption('ssl'))
+    auth_username = request.config.getoption('auth_username', default=None)
+    auth_password = request.config.getoption('auth_password', default=None)
+    if auth_username is not None and auth_password is not None:
+        auth_provider = PlainTextAuthProvider(username=auth_username, password=auth_password)
+    else:
+        auth_provider = None
+    return lambda: ManagerClient(
+        sock_path=direct_cluster_manager.sock_path,
+        port=port,
+        use_ssl=use_ssl,
+        auth_provider=auth_provider,
+        con_gen=cluster_con,
+        client_factory=lambda: DirectManagerClient(direct_cluster_manager),
+    )
+
+
 @pytest.fixture(scope=testpy_test_fixture_scope)
-async def manager_internal(request: pytest.FixtureRequest, manager_api_sock_path: str,
-                           cluster_manager: ScyllaClusterManager | None) -> Callable[[], ManagerClient]:
+async def socket_manager_internal(request: pytest.FixtureRequest, socket_manager_api_sock_path: str) -> Callable[[], ManagerClient]:
     """Session fixture to prepare client object for communicating with the Cluster API.
        Pass the manager transport used for communicating with the Cluster API.
        Pass a function to create driver connections.
@@ -255,15 +275,23 @@ async def manager_internal(request: pytest.FixtureRequest, manager_api_sock_path
         auth_provider = PlainTextAuthProvider(username=auth_username, password=auth_password)
     else:
         auth_provider = None
-    client_factory = None if cluster_manager is None else lambda: DirectManagerClient(cluster_manager)
     return lambda: ManagerClient(
-        sock_path=manager_api_sock_path,
+        sock_path=socket_manager_api_sock_path,
         port=port,
         use_ssl=use_ssl,
         auth_provider=auth_provider,
         con_gen=cluster_con,
-        client_factory=client_factory,
     )
+
+
+@pytest.fixture(scope="function")
+async def manager_internal(request: pytest.FixtureRequest,
+                           direct_manager_internal: Callable[[], ManagerClient] | None,
+                           socket_manager_internal: Callable[[], ManagerClient]) -> Callable[[], ManagerClient]:
+    del request
+    if direct_manager_internal is not None:
+        return direct_manager_internal
+    return socket_manager_internal
 
 
 @pytest.fixture(scope="function")

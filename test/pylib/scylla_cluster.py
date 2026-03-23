@@ -1620,6 +1620,7 @@ class ScyllaClusterManager:
                  test_uname: str,
                  clusters: Pool[ScyllaCluster],
                  base_dir: str,
+                 create_cluster: Callable[[logging.Logger | logging.LoggerAdapter], Awaitable[ScyllaCluster]] | None = None,
                  sock_path: str | None = None) -> None:
         self.test_uname: str = test_uname
         self.base_dir: str = base_dir
@@ -1631,6 +1632,7 @@ class ScyllaClusterManager:
         self.cluster: ScyllaCluster | None = None
         self.site: aiohttp.web.UnixSite | None = None
         self.clusters: Pool[ScyllaCluster] = clusters
+        self.create_cluster = create_cluster
         self.is_running: bool = False
         self.is_before_test_ok: bool = False
         self.is_after_test_ok: bool = False
@@ -1662,13 +1664,22 @@ class ScyllaClusterManager:
         if self.is_running:
             self.logger.warning("ScyllaClusterManager already running")
             return
-        self.cluster = await self.clusters.get(self.logger)
+        if self.create_cluster is None:
+            self.cluster = await self.clusters.get(self.logger)
+        else:
+            self.cluster = await self._create_cluster()
         self.logger.info("First Scylla cluster: %s", self.cluster)
         self.cluster.setLogger(self.logger)
         await self.runner.setup()
         self.site = aiohttp.web.UnixSite(self.runner, path=self.sock_path)
         await self.site.start()
         self.is_running = True
+
+    async def _create_cluster(self) -> ScyllaCluster:
+        assert self.create_cluster is not None
+        cluster = await self.create_cluster(self.logger)
+        self.logger.info("Created direct-mode Scylla cluster: %s", cluster)
+        return cluster
 
     async def _before_test(self, test_case_name: str) -> str:
         self.current_test_case_full_name = f'{self.test_uname}::{test_case_name}'
@@ -1685,7 +1696,11 @@ class ScyllaClusterManager:
         if self.cluster.is_dirty:
             self.logger.info(f"Current cluster %s is dirty after test %s, replacing with a new one...",
                              self.cluster.name, self.current_test_case_full_name)
-            self.cluster = await self.clusters.replace_dirty(self.cluster, self.logger)
+            if self.create_cluster is None:
+                self.cluster = await self.clusters.replace_dirty(self.cluster, self.logger)
+            else:
+                await self.clusters.destroy(self.cluster)
+                self.cluster = await self._create_cluster()
             self.logger.info("Got new Scylla cluster: %s", self.cluster.name)
         self.cluster.setLogger(self.logger)
         self.logger.info("Leasing Scylla cluster %s for test %s", self.cluster, self.current_test_case_full_name)
@@ -1701,7 +1716,10 @@ class ScyllaClusterManager:
             await self.site.stop()
             self.site = None
         if self.cluster:
-            if not self.cluster.is_dirty:
+            if self.create_cluster is not None:
+                self.logger.info("Destroying direct-mode Scylla cluster %s for test %s", self.cluster, self.test_uname)
+                await self.clusters.destroy(self.cluster)
+            elif not self.cluster.is_dirty:
                 self.logger.info("Returning Scylla cluster %s for test %s", self.cluster, self.test_uname)
                 await self.clusters.put(self.cluster, is_dirty=False)
             else:
