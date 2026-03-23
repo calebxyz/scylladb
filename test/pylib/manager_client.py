@@ -45,13 +45,14 @@ class ManagerClient:
     """Helper Manager API client
     Args:
         sock_path (str): path to an AF_UNIX socket where Manager server is listening
+        client_factory (Callable): optional factory creating a manager transport client
         con_gen (Callable): generator function for CQL driver connection to a cluster
     """
     # pylint: disable=too-many-public-methods
 
     def __init__(self, sock_path: str, port: int, use_ssl: bool, auth_provider: Any|None,
-                 con_gen: Callable[[List[IPAddress], int, bool, Any, LoadBalancingPolicy], CassandraCluster]) \
-                         -> None:
+                 con_gen: Callable[[List[IPAddress], int, bool, Any, LoadBalancingPolicy], CassandraCluster],
+                 client_factory: Optional[Callable[[], Any]] = None) -> None:
         self.test_log_fh: Optional[logging.FileHandler] = None
         self.port = port
         self.use_ssl = use_ssl
@@ -62,7 +63,8 @@ class ManagerClient:
         self.cql: Optional[CassandraSession] = None
         # A client for communicating with ScyllaClusterManager (server)
         self.sock_path = sock_path
-        self.client_for_asyncio_loop = {asyncio.get_running_loop(): UnixRESTClient(sock_path)}
+        self.client_factory = client_factory or (lambda: UnixRESTClient(sock_path))
+        self.client_for_asyncio_loop = {asyncio.get_running_loop(): self.client_factory()}
         self.api = ScyllaRESTAPIClient()
         self.metrics = ScyllaMetricsClient()
         self.thread_pool = ThreadPoolExecutor()
@@ -81,7 +83,7 @@ class ManagerClient:
             # close all clients in after_test->create new during after_test->close again after after_test.
         _client = self.client_for_asyncio_loop.get(asyncio.get_running_loop(), None)
         if _client is None:
-            _client = UnixRESTClient(self.sock_path)
+            _client = self.client_factory()
             self.client_for_asyncio_loop[asyncio.get_running_loop()] = _client
         return _client
 
