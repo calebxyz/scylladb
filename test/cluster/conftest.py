@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import ssl
 import tempfile
+import threading
 import platform
 import urllib.parse
 import warnings
@@ -25,23 +26,27 @@ from test.pylib.util import unique_name
 from test.pylib.direct_manager_client import DirectManagerClient
 from test.pylib.manager_client import ManagerClient
 from test.pylib.async_cql import run_async
-from test.pylib.scylla_cluster import ScyllaClusterManager, ScyllaVersionDescription, get_scylla_2025_1_description
+from test.pylib.scylla_cluster import (
+    ScyllaClusterManager,
+    ScyllaVersionDescription,
+    get_scylla_2025_1_description,
+)
 from test.pylib.suite.base import get_testpy_test
 from test.pylib.suite.python import add_cql_connection_options
 from test.pylib.encryption_provider import KeyProvider, make_key_provider_factory
 import logging
 import pytest
 import pytest_asyncio
-from cassandra.auth import PlainTextAuthProvider                         # type: ignore # pylint: disable=no-name-in-module
-from cassandra.cluster import Session                                    # type: ignore # pylint: disable=no-name-in-module
-from cassandra.cluster import Cluster, ConsistencyLevel                  # type: ignore # pylint: disable=no-name-in-module
-from cassandra.cluster import ExecutionProfile, EXEC_PROFILE_DEFAULT     # type: ignore # pylint: disable=no-name-in-module
-from cassandra.policies import ExponentialReconnectionPolicy             # type: ignore
-from cassandra.policies import RoundRobinPolicy                          # type: ignore
-from cassandra.policies import TokenAwarePolicy                          # type: ignore
-from cassandra.policies import WhiteListRoundRobinPolicy                 # type: ignore
-from cassandra.connection import DRIVER_NAME       # type: ignore # pylint: disable=no-name-in-module
-from cassandra.connection import DRIVER_VERSION    # type: ignore # pylint: disable=no-name-in-module
+from cassandra.auth import PlainTextAuthProvider  # type: ignore # pylint: disable=no-name-in-module
+from cassandra.cluster import Session  # type: ignore # pylint: disable=no-name-in-module
+from cassandra.cluster import Cluster, ConsistencyLevel  # type: ignore # pylint: disable=no-name-in-module
+from cassandra.cluster import ExecutionProfile, EXEC_PROFILE_DEFAULT  # type: ignore # pylint: disable=no-name-in-module
+from cassandra.policies import ExponentialReconnectionPolicy  # type: ignore
+from cassandra.policies import RoundRobinPolicy  # type: ignore
+from cassandra.policies import TokenAwarePolicy  # type: ignore
+from cassandra.policies import WhiteListRoundRobinPolicy  # type: ignore
+from cassandra.connection import DRIVER_NAME  # type: ignore # pylint: disable=no-name-in-module
+from cassandra.connection import DRIVER_VERSION  # type: ignore # pylint: disable=no-name-in-module
 from collections.abc import AsyncIterator
 
 if TYPE_CHECKING:
@@ -54,7 +59,7 @@ if TYPE_CHECKING:
     from test.pylib.suite.base import Test
 
 
-Session.run_async = run_async     # patch Session for convenience
+Session.run_async = run_async  # patch Session for convenience
 
 
 logger = logging.getLogger(__name__)
@@ -77,16 +82,30 @@ async def decode_backtrace(build_mode: str, input: str):
 
 
 def pytest_addoption(parser):
-    parser.addoption('--manager-api', action='store',
-                     help='Manager unix socket path')
-    parser.addoption('--manager-mode', action='store', choices=['direct', 'socket'], default='direct',
-                     help='Manager transport mode for in-process topology tests')
+    parser.addoption("--manager-api", action="store", help="Manager unix socket path")
+    parser.addoption(
+        "--manager-mode",
+        action="store",
+        choices=["direct", "socket"],
+        default="direct",
+        help="Manager transport mode for in-process topology tests",
+    )
     add_cql_connection_options(parser)
-    parser.addoption('--skip-internet-dependent-tests', action='store_true', default=False,
-                     help='Skip tests which depend on artifacts from the internet')
-    parser.addoption('--artifacts_dir_url', action='store', type=str, default=None, dest='artifacts_dir_url',
-                     help='Provide the URL to artifacts directory to generate the link to failed tests directory '
-                          'with logs')
+    parser.addoption(
+        "--skip-internet-dependent-tests",
+        action="store_true",
+        default=False,
+        help="Skip tests which depend on artifacts from the internet",
+    )
+    parser.addoption(
+        "--artifacts_dir_url",
+        action="store",
+        type=str,
+        default=None,
+        dest="artifacts_dir_url",
+        help="Provide the URL to artifacts directory to generate the link to failed tests directory "
+        "with logs",
+    )
 
 
 # This is a constant used in `pytest_runtest_makereport` below to store the full report for the test case
@@ -109,8 +128,62 @@ def pytest_runtest_makereport(item, call):
     item.stash[PHASE_REPORT_KEY] = report
 
 
+class _DirectManagerContext:
+    def __init__(self, testpy_test: Test) -> None:
+        self._testpy_test = testpy_test
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._thread: threading.Thread | None = None
+        self._started = threading.Event()
+        self._start_error: BaseException | None = None
+        self.manager: ScyllaClusterManager | None = None
+
+    def start(self) -> None:
+        def run() -> None:
+            loop = asyncio.new_event_loop()
+            self._loop = loop
+            asyncio.set_event_loop(loop)
+            try:
+                self.manager = ScyllaClusterManager(
+                    test_uname=self._testpy_test.uname,
+                    clusters=self._testpy_test.suite.clusters,
+                    base_dir=str(self._testpy_test.suite.log_dir),
+                )
+                loop.run_until_complete(self.manager.start())
+            except BaseException as exc:
+                self._start_error = exc
+                self._started.set()
+                loop.close()
+                return
+            self._started.set()
+            loop.run_forever()
+            loop.run_until_complete(loop.shutdown_asyncgens())
+            loop.close()
+
+        self._thread = threading.Thread(
+            target=run, name=f"{self._testpy_test.uname}-manager-loop"
+        )
+        self._thread.start()
+        self._started.wait()
+        if self._start_error is not None:
+            raise self._start_error
+
+    def stop(self) -> None:
+        assert self._loop is not None
+        assert self._thread is not None
+        assert self.manager is not None
+        future = asyncio.run_coroutine_threadsafe(self.manager.stop(), self._loop)
+        future.result()
+        self._loop.call_soon_threadsafe(self._loop.stop)
+        self._thread.join()
+
+    def call(self, awaitable):
+        assert self._loop is not None
+        return asyncio.run_coroutine_threadsafe(awaitable, self._loop).result()
+
+
 conn_logger = logging.getLogger("conn_messages")
 conn_logger.setLevel(logging.INFO)
+
 
 class CustomConnection(Cluster.connection_class):
     def send_msg(self, *args, **argv):
@@ -123,11 +196,18 @@ class CustomConnection(Cluster.connection_class):
 
 
 # cluster_con helper: set up client object for communicating with the CQL API.
-def cluster_con(hosts: list[IPAddress | EndPoint], port: int = 9042, use_ssl: bool = False, auth_provider=None,
-                load_balancing_policy=RoundRobinPolicy()):
+def cluster_con(
+    hosts: list[IPAddress | EndPoint],
+    port: int = 9042,
+    use_ssl: bool = False,
+    auth_provider=None,
+    load_balancing_policy=RoundRobinPolicy(),
+):
     """Create a CQL Cluster connection object according to configuration.
-       It does not .connect() yet."""
-    assert len(hosts) > 0, "python driver connection needs at least one host to connect to"
+    It does not .connect() yet."""
+    assert len(hosts) > 0, (
+        "python driver connection needs at least one host to connect to"
+    )
     profile = ExecutionProfile(
         load_balancing_policy=load_balancing_policy,
         consistency_level=ConsistencyLevel.LOCAL_QUORUM,
@@ -138,12 +218,14 @@ def cluster_con(hosts: list[IPAddress | EndPoint], port: int = 9042, use_ssl: bo
         # incremented to 200 seconds.
         # See issue #11289.
         # NOTE: request_timeout is the main cause of timeouts, even if logs say heartbeat
-        request_timeout=200)
+        request_timeout=200,
+    )
     whitelist_profile = ExecutionProfile(
         load_balancing_policy=TokenAwarePolicy(WhiteListRoundRobinPolicy(hosts)),
         consistency_level=ConsistencyLevel.LOCAL_QUORUM,
         serial_consistency_level=ConsistencyLevel.LOCAL_SERIAL,
-        request_timeout=200)
+        request_timeout=200,
+    )
     if use_ssl:
         # Scylla does not support any earlier TLS protocol. If you try,
         # you will get mysterious EOF errors (see issue #6971) :-(
@@ -151,58 +233,64 @@ def cluster_con(hosts: list[IPAddress | EndPoint], port: int = 9042, use_ssl: bo
     else:
         ssl_context = None
 
-    return Cluster(execution_profiles={EXEC_PROFILE_DEFAULT: profile, 'whitelist': whitelist_profile},
-                   contact_points=hosts,
-                   port=port,
-                   # TODO: make the protocol version an option, to allow testing with
-                   # different versions. If we drop this setting completely, it will
-                   # mean pick the latest version supported by the client and the server.
-                   protocol_version=4,
-                   # NOTE: No auth provider as auth keysppace has RF=1 and topology will take
-                   # down nodes, causing errors. If auth is needed in the future for topology
-                   # tests, they should bump up auth RF and run repair.
-                   ssl_context=ssl_context,
-                   # The default timeouts should have been more than enough, but in some
-                   # extreme cases with a very slow debug build running on a slow or very busy
-                   # machine, they may not be. Observed tests reach 160 seconds. So it's
-                   # incremented to 200 seconds.
-                   # See issue #11289.
-                   connect_timeout = 200,
-                   control_connection_timeout = 200,
-                   # NOTE: max_schema_agreement_wait must be 2x or 3x smaller than request_timeout
-                   # else the driver can't handle a server being down
-                   max_schema_agreement_wait=20,
-                   idle_heartbeat_timeout=200,
-                   # The default reconnection policy has a large maximum interval
-                   # between retries (600 seconds). In tests that restart/replace nodes,
-                   # where a node can be unavailable for an extended period of time,
-                   # this can cause the reconnection retry interval to get very large,
-                   # longer than a test timeout.
-                   reconnection_policy = ExponentialReconnectionPolicy(1.0, 4.0),
+    return Cluster(
+        execution_profiles={
+            EXEC_PROFILE_DEFAULT: profile,
+            "whitelist": whitelist_profile,
+        },
+        contact_points=hosts,
+        port=port,
+        # TODO: make the protocol version an option, to allow testing with
+        # different versions. If we drop this setting completely, it will
+        # mean pick the latest version supported by the client and the server.
+        protocol_version=4,
+        # NOTE: No auth provider as auth keysppace has RF=1 and topology will take
+        # down nodes, causing errors. If auth is needed in the future for topology
+        # tests, they should bump up auth RF and run repair.
+        ssl_context=ssl_context,
+        # The default timeouts should have been more than enough, but in some
+        # extreme cases with a very slow debug build running on a slow or very busy
+        # machine, they may not be. Observed tests reach 160 seconds. So it's
+        # incremented to 200 seconds.
+        # See issue #11289.
+        connect_timeout=200,
+        control_connection_timeout=200,
+        # NOTE: max_schema_agreement_wait must be 2x or 3x smaller than request_timeout
+        # else the driver can't handle a server being down
+        max_schema_agreement_wait=20,
+        idle_heartbeat_timeout=200,
+        # The default reconnection policy has a large maximum interval
+        # between retries (600 seconds). In tests that restart/replace nodes,
+        # where a node can be unavailable for an extended period of time,
+        # this can cause the reconnection retry interval to get very large,
+        # longer than a test timeout.
+        reconnection_policy=ExponentialReconnectionPolicy(1.0, 4.0),
+        auth_provider=auth_provider,
+        # Capture messages for debugging purposes.
+        connection_class=CustomConnection,
+    )
 
-                   auth_provider=auth_provider,
-                   # Capture messages for debugging purposes.
-                   connection_class=CustomConnection
-                   )
 
-
-@pytest_asyncio.fixture(scope="function", loop_scope="function")
-async def direct_cluster_manager(request: pytest.FixtureRequest, testpy_test: Test | None) -> AsyncGenerator[ScyllaClusterManager | None]:
+@pytest.fixture(scope=testpy_test_fixture_scope)
+def direct_cluster_manager_context(
+    request: pytest.FixtureRequest, testpy_test: Test | None
+):
     if testpy_test is None or request.config.getoption("--manager-mode") == "socket":
         yield None
         return
 
-    mgr = ScyllaClusterManager(test_uname=testpy_test.uname, clusters=testpy_test.suite.clusters,
-                               base_dir=str(testpy_test.suite.log_dir), create_cluster=testpy_test.suite.create_cluster)
-    await mgr.start()
+    ctx = _DirectManagerContext(testpy_test)
+    ctx.start()
     try:
-        yield mgr
+        yield ctx
     finally:
-        await mgr.stop()
+        ctx.stop()
 
 
 @pytest.fixture(scope=testpy_test_fixture_scope)
-async def socket_manager_api_sock_path(request: pytest.FixtureRequest, testpy_test: Test | None) -> AsyncGenerator[str]:
+async def socket_manager_api_sock_path(
+    request: pytest.FixtureRequest, testpy_test: Test | None
+) -> AsyncGenerator[str]:
     if testpy_test is None:
         manager_api = request.config.getoption("--manager-api")
         if not isinstance(manager_api, str) or not manager_api:
@@ -220,13 +308,19 @@ async def socket_manager_api_sock_path(request: pytest.FixtureRequest, testpy_te
         stop_event = Event()
 
         async def run_manager() -> None:
-            mgr = ScyllaClusterManager(test_uname=test_uname, clusters=clusters, base_dir=base_dir, sock_path=sock_path)
+            mgr = ScyllaClusterManager(
+                test_uname=test_uname,
+                clusters=clusters,
+                base_dir=base_dir,
+                sock_path=sock_path,
+            )
             await mgr.start()
             start_event.set()
             try:
                 await asyncio.get_running_loop().run_in_executor(None, stop_event.wait)
             finally:
                 await mgr.stop()
+
         with ThreadPoolExecutor(max_workers=1) as executor:
             future = executor.submit(asyncio.run, run_manager())
             start_event.wait()
@@ -237,42 +331,54 @@ async def socket_manager_api_sock_path(request: pytest.FixtureRequest, testpy_te
             future.result()
 
 
-@pytest_asyncio.fixture(scope="function", loop_scope="function")
-async def direct_manager_internal(request: pytest.FixtureRequest, direct_cluster_manager: ScyllaClusterManager | None) -> Callable[[], ManagerClient] | None:
-    if direct_cluster_manager is None:
+@pytest.fixture(scope="function")
+def direct_manager_internal(
+    request: pytest.FixtureRequest,
+    direct_cluster_manager_context: _DirectManagerContext | None,
+) -> Callable[[], ManagerClient] | None:
+    if direct_cluster_manager_context is None:
         return None
+    assert direct_cluster_manager_context.manager is not None
 
-    port = int(request.config.getoption('port'))
-    use_ssl = bool(request.config.getoption('ssl'))
-    auth_username = request.config.getoption('auth_username', default=None)
-    auth_password = request.config.getoption('auth_password', default=None)
+    port = int(request.config.getoption("port"))
+    use_ssl = bool(request.config.getoption("ssl"))
+    auth_username = request.config.getoption("auth_username", default=None)
+    auth_password = request.config.getoption("auth_password", default=None)
     if auth_username is not None and auth_password is not None:
-        auth_provider = PlainTextAuthProvider(username=auth_username, password=auth_password)
+        auth_provider = PlainTextAuthProvider(
+            username=auth_username, password=auth_password
+        )
     else:
         auth_provider = None
     return lambda: ManagerClient(
-        sock_path=direct_cluster_manager.sock_path,
+        sock_path=direct_cluster_manager_context.manager.sock_path,
         port=port,
         use_ssl=use_ssl,
         auth_provider=auth_provider,
         con_gen=cluster_con,
-        client_factory=lambda: DirectManagerClient(direct_cluster_manager),
+        client_factory=lambda: DirectManagerClient(
+            direct_cluster_manager_context.manager, direct_cluster_manager_context.call
+        ),
     )
 
 
 @pytest.fixture(scope=testpy_test_fixture_scope)
-async def socket_manager_internal(request: pytest.FixtureRequest, socket_manager_api_sock_path: str) -> Callable[[], ManagerClient]:
+async def socket_manager_internal(
+    request: pytest.FixtureRequest, socket_manager_api_sock_path: str
+) -> Callable[[], ManagerClient]:
     """Session fixture to prepare client object for communicating with the Cluster API.
-       Pass the manager transport used for communicating with the Cluster API.
-       Pass a function to create driver connections.
-       Test cases (functions) should not use this fixture.
+    Pass the manager transport used for communicating with the Cluster API.
+    Pass a function to create driver connections.
+    Test cases (functions) should not use this fixture.
     """
-    port = int(request.config.getoption('port'))
-    use_ssl = bool(request.config.getoption('ssl'))
-    auth_username = request.config.getoption('auth_username', default=None)
-    auth_password = request.config.getoption('auth_password', default=None)
+    port = int(request.config.getoption("port"))
+    use_ssl = bool(request.config.getoption("ssl"))
+    auth_username = request.config.getoption("auth_username", default=None)
+    auth_password = request.config.getoption("auth_password", default=None)
     if auth_username is not None and auth_password is not None:
-        auth_provider = PlainTextAuthProvider(username=auth_username, password=auth_password)
+        auth_provider = PlainTextAuthProvider(
+            username=auth_username, password=auth_password
+        )
     else:
         auth_provider = None
     return lambda: ManagerClient(
@@ -285,9 +391,11 @@ async def socket_manager_internal(request: pytest.FixtureRequest, socket_manager
 
 
 @pytest.fixture(scope="function")
-async def manager_internal(request: pytest.FixtureRequest,
-                           direct_manager_internal: Callable[[], ManagerClient] | None,
-                           socket_manager_internal: Callable[[], ManagerClient]) -> Callable[[], ManagerClient]:
+async def manager_internal(
+    request: pytest.FixtureRequest,
+    direct_manager_internal: Callable[[], ManagerClient] | None,
+    socket_manager_internal: Callable[[], ManagerClient],
+) -> Callable[[], ManagerClient]:
     del request
     if direct_manager_internal is not None:
         return direct_manager_internal
@@ -295,21 +403,30 @@ async def manager_internal(request: pytest.FixtureRequest,
 
 
 @pytest.fixture(scope="function")
-async def manager(request: pytest.FixtureRequest,
-                  manager_internal: Callable[[], ManagerClient],
-                  record_property: Callable[[str, object], None],
-                  build_mode: str) -> AsyncGenerator[ManagerClient]:
+async def manager(
+    request: pytest.FixtureRequest,
+    manager_internal: Callable[[], ManagerClient],
+    record_property: Callable[[str, object], None],
+    build_mode: str,
+) -> AsyncGenerator[ManagerClient]:
     """
     Per test fixture to notify Manager client object when tests begin so it can perform checks for cluster state.
     """
-    testpy_test = await get_testpy_test(path=request.path, options=request.config.option, mode=build_mode)
+    testpy_test = await get_testpy_test(
+        path=request.path, options=request.config.option, mode=build_mode
+    )
     test_case_name = request.node.name
     suite_testpy_log = testpy_test.log_filename
-    test_log = suite_testpy_log.parent / f"{Path(suite_testpy_log.stem).stem}.{test_case_name}.log"
+    test_log = (
+        suite_testpy_log.parent
+        / f"{Path(suite_testpy_log.stem).stem}.{test_case_name}.log"
+    )
     # this should be consistent with scylla_cluster.py handler name in _before_test method
     test_py_log_test = suite_testpy_log.parent / f"{test_log.stem}_cluster.log"
 
-    manager_client = manager_internal()  # set up client object in fixture with scope function
+    manager_client = (
+        manager_internal()
+    )  # set up client object in fixture with scope function
     await manager_client.before_test(test_case_name, test_log)
     yield manager_client
     # `request.node.stash` contains a report stored in `pytest_runtest_makereport` from where we can retrieve
@@ -318,29 +435,38 @@ async def manager(request: pytest.FixtureRequest,
     failed = report.when == "call" and report.failed
 
     # Check if the test has the check_nodes_for_errors marker
-    found_errors = await manager_client.check_all_errors(check_all_errors=(request.node.get_closest_marker("check_nodes_for_errors") is not None))
+    found_errors = await manager_client.check_all_errors(
+        check_all_errors=(
+            request.node.get_closest_marker("check_nodes_for_errors") is not None
+        )
+    )
 
     failed_test_dir_path = None
     if failed or found_errors:
         # Save scylladb logs for failed tests in a separate directory and copy XML report to the same directory to have
         # all related logs in one dir.
         # Then add property to the XML report with the path to the directory, so it can be visible in Jenkins
-        failed_test_dir_path = testpy_test.suite.log_dir / "failed_test" / test_case_name.translate(
-            str.maketrans('[]', '()'))
+        failed_test_dir_path = (
+            testpy_test.suite.log_dir
+            / "failed_test"
+            / test_case_name.translate(str.maketrans("[]", "()"))
+        )
         failed_test_dir_path.mkdir(parents=True, exist_ok=True)
 
     if failed:
         await manager_client.gather_related_logs(
             failed_test_dir_path,
-            {'pytest.log': test_log, 'test_py.log': test_py_log_test}
+            {"pytest.log": test_log, "test_py.log": test_py_log_test},
         )
         with open(failed_test_dir_path / "stacktrace.txt", "w") as f:
             f.write(report.longreprtext)
-        if request.config.getoption('artifacts_dir_url') is not None:
+        if request.config.getoption("artifacts_dir_url") is not None:
             # get the relative path to the tmpdir for the failed directory
-            dir_path_relative = f"{failed_test_dir_path.as_posix()[failed_test_dir_path.as_posix().find('testlog'):]}"
-            full_url = urllib.parse.urljoin(request.config.getoption('artifacts_dir_url') + '/',
-                                            urllib.parse.quote(dir_path_relative))
+            dir_path_relative = f"{failed_test_dir_path.as_posix()[failed_test_dir_path.as_posix().find('testlog') :]}"
+            full_url = urllib.parse.urljoin(
+                request.config.getoption("artifacts_dir_url") + "/",
+                urllib.parse.quote(dir_path_relative),
+            )
             record_property("TEST_LOGS", full_url)
 
     cluster_status = await manager_client.after_test(test_case_name, not failed)
@@ -350,7 +476,7 @@ async def manager(request: pytest.FixtureRequest,
         failed = True
         pytest.fail(
             f"test case {test_case_name} left unfinished tasks on Scylla server. Server marked as broken,"
-            f" server_broken_reason: {cluster_status["message"]}"
+            f" server_broken_reason: {cluster_status['message']}"
         )
     if found_errors:
         full_message = []
@@ -364,12 +490,17 @@ async def manager(request: pytest.FixtureRequest,
 
             if backtraces := data.get("backtraces", []):
                 summary.append(f"{len(backtraces)} backtrace(s)")
-                with open(failed_test_dir_path / f"scylla-{server.server_id}-backtraces.txt", "w") as bt_file:
+                with open(
+                    failed_test_dir_path / f"scylla-{server.server_id}-backtraces.txt",
+                    "w",
+                ) as bt_file:
                     for backtrace in backtraces:
                         bt_file.write(backtrace + "\n\n")
                         decoded_bt = await decode_backtrace(build_mode, backtrace)
                         bt_file.write(decoded_bt + "\n\n")
-                    detailed.append(f"{len(backtraces)} backtrace(s) saved in {Path(bt_file.name).name}")
+                    detailed.append(
+                        f"{len(backtraces)} backtrace(s) saved in {Path(bt_file.name).name}"
+                    )
 
             if errors := data.get("error", []):
                 summary.append(f"{len(errors)} error(s)")
@@ -379,7 +510,7 @@ async def manager(request: pytest.FixtureRequest,
                 summary.append(f"{len(cores)} core(s): {', '.join(cores)}")
 
             if summary:
-                summary_line = f"Server {server.server_id}: found {', '.join(summary)} (log: { data['log']})"
+                summary_line = f"Server {server.server_id}: found {', '.join(summary)} (log: {data['log']})"
                 detailed = [f"  {line}" for line in detailed]
                 full_message.append(summary_line)
                 full_message.extend(detailed)
@@ -389,11 +520,13 @@ async def manager(request: pytest.FixtureRequest,
         if not failed:
             pytest.fail(f"\n{'\n'.join(full_message)}")
 
+
 # "cql" fixture: set up client object for communicating with the CQL API.
 # Since connection is managed by manager just return that object
 @pytest.fixture(scope="function")
 def cql(manager):
     yield manager.cql
+
 
 # "random_tables" fixture: Creates and returns a temporary RandomTables object
 # used in tests to make schema changes. Tables are dropped after test finishes
@@ -404,8 +537,14 @@ async def random_tables(request, manager):
     replication_factor = rf_marker.args[0] if rf_marker is not None else 3  # Default 3
     enable_tablets = request.node.get_closest_marker("enable_tablets")
     enable_tablets = enable_tablets.args[0] if enable_tablets is not None else None
-    tables = RandomTables(request.node.name, manager, unique_name(),
-                          replication_factor, None, enable_tablets)
+    tables = RandomTables(
+        request.node.name,
+        manager,
+        unique_name(),
+        replication_factor,
+        None,
+        enable_tablets,
+    )
     yield tables
 
     # Don't drop tables at the end if we failed or the cluster is dirty - it may be impossible
@@ -418,6 +557,7 @@ async def random_tables(request, manager):
     failed = report.when == "call" and report.failed
     if not failed and not await manager.is_dirty():
         tables.drop_all()
+
 
 @pytest.fixture(scope="function", autouse=True)
 async def prepare_3_nodes_cluster(request, manager):
@@ -433,13 +573,16 @@ async def prepare_3_racks_cluster(request, manager):
 
 @pytest.fixture(scope="function")
 def internet_dependency_enabled(request) -> None:
-    if request.config.getoption('skip_internet_dependent_tests'):
+    if request.config.getoption("skip_internet_dependent_tests"):
         pytest.skip(reason="skip_internet_dependent_tests is set")
 
 
 @pytest.fixture(scope="function")
-async def scylla_2025_1(request, build_mode, internet_dependency_enabled) -> AsyncIterator[ScyllaVersionDescription]:
+async def scylla_2025_1(
+    request, build_mode, internet_dependency_enabled
+) -> AsyncIterator[ScyllaVersionDescription]:
     yield await get_scylla_2025_1_description(build_mode)
+
 
 @pytest.fixture(scope="function", params=list(KeyProvider))
 async def key_provider(request, tmpdir, scylla_binary):
