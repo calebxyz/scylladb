@@ -2505,8 +2505,9 @@ void cql_server::response::write(const cql3::metadata& m, const cql_metadata_id_
     }
 
     cql3::cql_metadata_id_type calculated_metadata_id{bytes{}};
-    if (metadata_id.has_request_metadata_id() && metadata_id.has_response_metadata_id()) {
-        if (metadata_id.get_request_metadata_id() != metadata_id.get_response_metadata_id()) {
+    if (metadata_id.has_request_metadata_id()) {
+        calculated_metadata_id = m.calculate_metadata_id();
+        if (metadata_id.get_request_metadata_id() != calculated_metadata_id) {
             flags.remove<cql3::metadata::flag::NO_METADATA>();
             flags.set<cql3::metadata::flag::METADATA_CHANGED>();
             no_metadata = false;
@@ -2525,7 +2526,7 @@ void cql_server::response::write(const cql3::metadata& m, const cql_metadata_id_
     }
 
     if (flags.contains<cql3::metadata::flag::METADATA_CHANGED>()) {
-        write_short_bytes(metadata_id.get_response_metadata_id()._metadata_id);
+        write_short_bytes(calculated_metadata_id._metadata_id);
     }
 
     auto names_i = m.get_names().begin();
