@@ -62,6 +62,7 @@ private:
 private:
     lw_shared_ptr<column_info> _column_info;
     lw_shared_ptr<const service::pager::paging_state> _paging_state;
+    mutable std::optional<cql_metadata_id_type> _cached_metadata_id;
 
 public:
     metadata(std::vector<lw_shared_ptr<column_specification>> names_);

@@ -796,6 +796,33 @@ BOOST_AUTO_TEST_CASE(metadata_id_changed_rows_response_overrides_no_metadata) {
             reinterpret_cast<const bytes::value_type*>(ptr)));
 }
 
+BOOST_AUTO_TEST_CASE(metadata_id_cache_is_invalidated_on_visible_metadata_change) {
+    auto columns_specification = make_columns_specification({{"c1", int32_type}, {"c2", utf8_type}});
+    cql3::metadata metadata(columns_specification);
+
+    const auto initial_metadata_id = metadata.calculate_metadata_id();
+    BOOST_REQUIRE_EQUAL(initial_metadata_id, metadata.calculate_metadata_id());
+
+    metadata.hide_last_column();
+    const auto hidden_column_metadata_id = metadata.calculate_metadata_id();
+    BOOST_REQUIRE_NE(initial_metadata_id, hidden_column_metadata_id);
+    BOOST_REQUIRE_EQUAL(hidden_column_metadata_id, metadata.calculate_metadata_id());
+}
+
+BOOST_AUTO_TEST_CASE(metadata_id_cache_ignores_non_serialized_columns) {
+    auto columns_specification = make_columns_specification({{"c1", int32_type}});
+    cql3::metadata metadata(columns_specification);
+
+    const auto initial_metadata_id = metadata.calculate_metadata_id();
+
+    metadata.add_non_serialized_column(make_lw_shared<cql3::column_specification>(
+            "ks", "cf", make_shared<cql3::column_identifier>("c2", false), utf8_type));
+
+    const auto metadata_id_with_hidden_column = metadata.calculate_metadata_id();
+    BOOST_REQUIRE_EQUAL(initial_metadata_id, metadata_id_with_hidden_column);
+    BOOST_REQUIRE_EQUAL(metadata_id_with_hidden_column, metadata.calculate_metadata_id());
+}
+
 BOOST_AUTO_TEST_CASE(metadata_id_with_udt) {
 
     auto compute_metadata_id_for_type = [&](

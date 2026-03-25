@@ -46,6 +46,7 @@ void metadata::add_non_serialized_column(lw_shared_ptr<column_specification> nam
     // See comment above. Because columnCount doesn't account the newly added name, it
     // won't be serialized.
     _column_info->_names.emplace_back(std::move(name));
+    _cached_metadata_id.reset();
 }
 
 void metadata::hide_last_column() {
@@ -53,6 +54,7 @@ void metadata::hide_last_column() {
         utils::on_internal_error("Trying to hide a column when there are no columns visible.");
     }
     _column_info->_column_count--;
+    _cached_metadata_id.reset();
 }
 
 void metadata::set_paging_state(lw_shared_ptr<const service::pager::paging_state> paging_state) {
@@ -85,13 +87,18 @@ lw_shared_ptr<const service::pager::paging_state> metadata::paging_state() const
 // Metadata_id is a checksum computed from given metadata to track schema changes in prepared statements.
 // Originally introduced in CQLv5.
 cql3::cql_metadata_id_type metadata::calculate_metadata_id() const {
+    if (_cached_metadata_id) {
+        return *_cached_metadata_id;
+    }
+
     auto h = sha256_hasher();
     for (uint32_t i = 0; i < _column_info->_column_count; ++i) {
         feed_hash(h, _column_info->_names[i]->name->name());
         feed_hash(h, _column_info->_names[i]->type->name());
     }
     // Return first 16 bytes to have the same length as Cassandra's MD5
-    return cql_metadata_id_type(h.finalize().substr(0, 16));
+    _cached_metadata_id = cql_metadata_id_type(h.finalize().substr(0, 16));
+    return *_cached_metadata_id;
 }
 
 prepared_metadata::prepared_metadata(const std::vector<lw_shared_ptr<column_specification>>& names,
