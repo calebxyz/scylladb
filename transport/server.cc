@@ -65,6 +65,7 @@
 
 #include "transport/cql_protocol_extension.hh"
 #include "utils/bit_cast.hh"
+#include "utils/error_injection.hh"
 #include "utils/labels.hh"
 #include "utils/result.hh"
 #include "utils/reusable_buffer.hh"
@@ -1304,14 +1305,25 @@ process_execute_internal(service::client_state& client_state, sharded<cql3::quer
     }
 
     tracing::trace(trace_state, "Processing a statement");
-    return qp.local().execute_prepared_without_checking_exception_message(query_state, std::move(stmt), options, std::move(prepared), std::move(cache_key), needs_authorization)
-            .then([trace_state = query_state.get_trace_state(), skip_metadata, q_state = std::move(q_state), stream, version, metadata_id = std::move(metadata_id)] (auto msg) mutable {
+    const bool result_metadata_was_empty = prepared->result_metadata_is_empty();
+    return qp.local().execute_prepared_without_checking_exception_message(query_state, std::move(stmt), options, std::move(prepared), cache_key, needs_authorization)
+            .then([&qp, trace_state = query_state.get_trace_state(), skip_metadata, q_state = std::move(q_state), stream, version,
+                   metadata_id = std::move(metadata_id), cache_key = std::move(cache_key), result_metadata_was_empty] (auto msg) mutable {
         if (msg->move_to_shard()) {
             return cql_server::process_fn_return_type(make_foreign(dynamic_pointer_cast<messages::result_message::bounce_to_shard>(msg)));
         } else if (msg->is_exception()) {
             return cql_server::process_fn_return_type(convert_error_message_to_coordinator_result(msg.get()));
         } else {
             tracing::trace(q_state->query_state.get_trace_state(), "Done processing - preparing a result");
+            if (result_metadata_was_empty && metadata_id.has_request_metadata_id()
+                    && !utils::get_local_injector().enter("skip_prepared_result_metadata_promotion")) {
+                if (auto rows = dynamic_pointer_cast<messages::result_message::rows>(msg)) {
+                    auto real_id = rows->rs().get_metadata().calculate_metadata_id();
+                    qp.local().update_prepared_result_metadata_id(cache_key, real_id);
+                    auto req = metadata_id.get_request_metadata_id();
+                    metadata_id = cql_metadata_id_wrapper(std::move(req), std::move(real_id));
+                }
+            }
             return cql_server::process_fn_return_type(make_foreign(make_result(stream, *msg, q_state->query_state.get_trace_state(), version, std::move(metadata_id), skip_metadata)));
         }
     });
@@ -2222,9 +2234,16 @@ void cql_server::response::write(const cql3::metadata& m, const cql_metadata_id_
     cql3::cql_metadata_id_type calculated_metadata_id{bytes{}};
     if (metadata_id.has_request_metadata_id() && metadata_id.has_response_metadata_id()) {
         if (metadata_id.get_request_metadata_id() != metadata_id.get_response_metadata_id()) {
-            flags.remove<cql3::metadata::flag::NO_METADATA>();
-            flags.set<cql3::metadata::flag::METADATA_CHANGED>();
-            no_metadata = false;
+            const bool skip_rows_metadata_changed_response = utils::get_local_injector().enter("skip_rows_metadata_changed_response");
+            clogger.debug("rows metadata changed response: request_metadata_id_present={}, response_metadata_id_present={}, metadata_changed={}, no_metadata_before={}, injection_fired={}",
+                    metadata_id.has_request_metadata_id(), metadata_id.has_response_metadata_id(),
+                    metadata_id.get_request_metadata_id() != metadata_id.get_response_metadata_id(),
+                    no_metadata, skip_rows_metadata_changed_response);
+            if (!skip_rows_metadata_changed_response) {
+                flags.remove<cql3::metadata::flag::NO_METADATA>();
+                flags.set<cql3::metadata::flag::METADATA_CHANGED>();
+                no_metadata = false;
+            }
         }
     }
 
